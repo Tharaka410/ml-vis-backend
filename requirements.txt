@@ -4,3 +4,4 @@ pydantic
 typing
 numpy
 uvicorn
+minisom

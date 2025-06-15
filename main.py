@@ -621,66 +621,66 @@ class LayerModel(BaseModel):
 
 class NetworkConfig(BaseModel):
     inputSize: int
-    hiddenSize: int
+    hiddenSize: int # For hidden layers
     outputNodes: int
-    hiddenLayers: int
-    activation: Literal["sigmoid", "relu", "identity", "softmax"]
-    learningRate: float # <--- ADD THIS
+    hiddenLayers: int # Number of hidden layers
+    activation: Literal["sigmoid", "relu", "identity","softmax"] # Activation for hidden layers
+    outputActivation: Literal["sigmoid", "relu", "identity", "softmax"] # NEW: Activation for output layer
+    learningRate: float
 
 class TrainRequest(BaseModel):
-    input: List[List[float]] # Input values for the network (e.g., [[0.5, -0.3]])
-    target: List[List[float]] # Target output for training (e.g., [[1.0]])
-    network: List[LayerModel] # Current network state from frontend
-    config: NetworkConfig # Training configuration
+    input: List[List[float]]
+    target: List[List[float]]
+    network: List[LayerModel]
+    config: NetworkConfig
 
 class TrainResponse(BaseModel):
     network: List[LayerModel]
     error: float
     accuracy: float
-    deltas: List[List[float]] # Store deltas for visualization
-    full_activations: List[List[float]] # Store all z and a values for visualization
+    deltas: List[List[float]]
+    full_activations: List[List[float]] # Store all z and a values (flattened to list of lists)
 
 class CustomPerceptron:
     def __init__(self, input_size: Optional[int] = None, hidden_size: Optional[int] = None,
                  output_nodes: Optional[int] = None, hidden_layers: int = 0,
-                 activation_name: str = "sigmoid", layers_data: Optional[List[LayerModel]] = None):
-        self.activation_name = activation_name
+                 activation_name: str = "sigmoid", output_activation_name: str = "sigmoid", # NEW PARAMETER
+                 layers_data: Optional[List[LayerModel]] = None):
+        self.hidden_activation_name = activation_name
+        self.output_activation_name = output_activation_name
         self.activations = {
             "sigmoid": self._sigmoid,
             "relu": self._relu,
             "identity": self._identity,
-            "softmax": self._softmax # Softmax is primarily for the output layer
+            "softmax": self._softmax
         }
         self.derivatives = {
             "sigmoid": self._sigmoid_derivative,
             "relu": self._relu_derivative,
             "identity": self._identity_derivative,
-            "softmax": self._softmax_derivative # For combined loss/softmax derivative
+            # Note: For Softmax with MSE, the derivative is complex (Jacobian).
+            # This simplified derivative is for chain rule if treated element-wise, but problematic for true Softmax+MSE.
+            # Cross-entropy is preferred with Softmax.
+            "softmax": self._softmax_derivative
         }
 
         if layers_data:
-            # Initialize network from provided data (frontend's current state)
             self.layers = []
             for layer_model in layers_data:
                 self.layers.append({
                     "weights": np.array(layer_model.weights),
                     "biases": np.array(layer_model.biases)
                 })
-            print(f"Backend - CustomPerceptron initialized with {len(self.layers)} actual weight/bias layers from data.")
         else:
-            # Initialize a new network from scratch (for /initialize endpoint)
-            if any(p is None for p in [input_size, hidden_size, output_nodes]):
-                raise ValueError("input_size, hidden_size, and output_nodes must be provided for new network initialization.")
-
             self.layers = []
             # Input to first hidden layer
             self.layers.append({
-                "weights": np.random.randn(hidden_size, input_size) * 0.01, # Small random weights
+                "weights": np.random.randn(hidden_size, input_size) * 0.01,
                 "biases": np.zeros(hidden_size)
             })
 
             # Additional hidden layers
-            for _ in range(hidden_layers - 1): # If hidden_layers is 0, this loop doesn't run. If 1, runs 0 times etc.
+            for _ in range(hidden_layers - 1):
                 self.layers.append({
                     "weights": np.random.randn(hidden_size, hidden_size) * 0.01,
                     "biases": np.zeros(hidden_size)
@@ -691,11 +691,9 @@ class CustomPerceptron:
                 "weights": np.random.randn(output_nodes, hidden_size) * 0.01,
                 "biases": np.zeros(output_nodes)
             })
-            print(f"Backend - CustomPerceptron initialized a NEW network with {len(self.layers)} total layers.")
-
 
     def _sigmoid(self, x: np.ndarray) -> np.ndarray:
-        return 1 / (1 + np.exp(-x))
+        return 1 / (1 + np.exp(-np.clip(x, -500, 500))) # Add clipping for numerical stability
 
     def _sigmoid_derivative(self, y: np.ndarray) -> np.ndarray:
         return y * (1 - y)
@@ -704,8 +702,7 @@ class CustomPerceptron:
         return np.maximum(0, x)
 
     def _relu_derivative(self, y: np.ndarray) -> np.ndarray:
-        # Derivative of ReLU where y is the output of ReLU (max(0, x))
-        return (y > 0).astype(float) # Returns 1 if y > 0, else 0
+        return (y > 0).astype(float)
 
     def _identity(self, x: np.ndarray) -> np.ndarray:
         return x
@@ -714,101 +711,121 @@ class CustomPerceptron:
         return np.ones_like(y)
     
     def _softmax(self, x: np.ndarray) -> np.ndarray:
-        # Numerically stable softmax
         exp_x = np.exp(x - np.max(x))
         return exp_x / np.sum(exp_x)
 
-    def _softmax_derivative(self, _: np.ndarray) -> np.ndarray:
-        return 1.0 # Placeholder, combined with error in backward pass
-    
-    def get_activation_function(self, name: str):
-        return self.activations.get(name, self._sigmoid) # Default to sigmoid
+    def _softmax_derivative(self, activated_output: np.ndarray) -> np.ndarray:
+        # This derivative is appropriate when softmax is followed by Cross-Entropy Loss
+        # and you want (y_hat - y). If used with MSE, it's problematic.
+        # For MSE, the d/dz_i (softmax_i) is s_i(1-s_i) + sum_{j!=i} (-s_i*s_j). This is not just s_i(1-s_i).
+        # To avoid overcomplicating, for MSE, we are essentially treating it element-wise like sigmoid.
+        # This will be `activated_output * (1 - activated_output)` for individual elements for simplified chain rule.
+        # However, for accurate softmax derivative in general, it's a Jacobian.
+        # Given the current structure, using y*(1-y) is the closest simplified element-wise derivative.
+        return activated_output * (1 - activated_output) # Simplified for element-wise chain rule
 
-    def get_activation_derivative(self, name: str):
-        return self.derivatives.get(name, self._sigmoid_derivative) # Default to sigmoid derivative
+    def get_activation_function(self, layer_idx: int):
+        if layer_idx == len(self.layers) - 1: # Last layer
+            return self.activations.get(self.output_activation_name, self._sigmoid)
+        return self.activations.get(self.hidden_activation_name, self._sigmoid)
+
+    def get_activation_derivative(self, layer_idx: int, activated_output: np.ndarray):
+        if layer_idx == len(self.layers) - 1: # Last layer
+            act_name = self.output_activation_name
+        else:
+            act_name = self.hidden_activation_name
+        
+        # Pass the activated output to the derivative function
+        if act_name == "sigmoid":
+            return self._sigmoid_derivative(activated_output)
+        elif act_name == "relu":
+            return self._relu_derivative(activated_output)
+        elif act_name == "identity":
+            return self._identity_derivative(activated_output)
+        elif act_name == "softmax":
+            return self._softmax_derivative(activated_output) # Use the (simplified) softmax derivative
 
     def forward_pass(self, input_data: List[float]):
-        """
-        Performs a forward pass through the network.
-        Returns a list of all raw outputs (z) and activated outputs (a) for each layer.
-        Structure: [z0, a0, z1, a1, ..., zn, an]
-        """
-        activations_list = [] # Will store z and a values
+        activations_list = [] # Will store a_0, z_1, a_1, z_2, a_2, ..., z_L, a_L
         current_activation = np.array(input_data)
+        activations_list.append(current_activation) # a_0 (input layer's output)
 
         for i, layer_data in enumerate(self.layers):
             weights = layer_data["weights"]
             biases = layer_data["biases"]
 
             z = np.dot(weights, current_activation) + biases
-            activations_list.append(z) # Store raw output (z)
+            activations_list.append(z) # z_{i+1} (raw output of current layer)
 
-            # Apply activation function
-            # Softmax is typically applied only to the final output layer for classification
-            if i == len(self.layers) - 1 and self.activation_name == "softmax":
-                current_activation = self._softmax(z)
-            else:
-                current_activation = self.get_activation_function(self.activation_name)(z)
-            
-            activations_list.append(current_activation) # Store activated values (a)
+            current_activation = self.get_activation_function(i)(z) # a_{i+1} (activated output of current layer)
+            activations_list.append(current_activation)
 
-        return activations_list # [z0, a0, z1, a1, ..., zn, an]
-
+        return activations_list
 
     def backward_pass(self, input_data, target, activations_list_raw, learning_rate):
-        deltas = [None] * len(self.layers)
-        
-        output_activations = activations_list_raw[-1]
-        output_raw = activations_list_raw[-2]
+        deltas = [None] * len(self.layers) # deltas[i] corresponds to the delta for self.layers[i]
 
+        # Output layer delta calculation (last layer in self.layers, index L-1)
+        # a_L is activations_list_raw[-1], z_L is activations_list_raw[-2]
+        output_activations = activations_list_raw[-1] # a_L
         target = np.array(target).reshape(output_activations.shape)
 
-        loss_derivative = 2 * (output_activations - target)
-        
-        output_activation_derivative_func = self.get_activation_derivative(self.activation_name)
-        output_layer_activation_derivative = np.array([output_activation_derivative_func(x) for x in output_activations])
+        loss_derivative = 2 * (output_activations - target) # dC/da_L (for MSE)
+
+        # da_L/dz_L using the output layer's specific activation derivative
+        output_layer_activation_derivative = self.get_activation_derivative(len(self.layers) - 1, output_activations)
         deltas[len(self.layers) - 1] = loss_derivative * output_layer_activation_derivative
 
+        # Backpropagate through hidden layers (from second-to-last layer down to the first hidden layer)
+        # Iterate from the (L-2)th layer down to the 0th layer (first hidden layer)
         for i in reversed(range(len(self.layers) - 1)):
-            current_layer = self.layers[i]
-            next_layer_weights = self.layers[i+1]['weights']
-            
-            current_layer_raw = activations_list_raw[i*2]
-            current_layer_activations = activations_list_raw[(i*2)+1]
+            current_layer_idx = i # This `i` is the 0-indexed layer in `self.layers`
 
-            error_delta = np.dot(next_layer_weights.T, deltas[i+1])
+            next_layer_weights = self.layers[current_layer_idx + 1]['weights'] # W_{i+1}
             
-            current_layer_activation_derivative_func = self.get_activation_derivative(self.activation_name)
-            current_layer_activation_derivative = np.array([current_layer_activation_derivative_func(x) for x in current_layer_activations])
-            deltas[i] = error_delta * current_layer_activation_derivative
-        
+            # error_prop is (W_{i+1})^T * delta_{i+1}
+            error_prop = np.dot(next_layer_weights.T, deltas[current_layer_idx + 1])
+
+            # activated output of the current layer (a_{i+1})
+            # a_k is at index 2*k. Here k = current_layer_idx + 1
+            current_layer_activations_a = activations_list_raw[(current_layer_idx + 1) * 2] 
+
+            # da_{i+1}/dz_{i+1} using the current layer's activation derivative
+            current_layer_activation_derivative = self.get_activation_derivative(current_layer_idx, current_layer_activations_a)
+            
+            deltas[current_layer_idx] = error_prop * current_layer_activation_derivative
+
+        # Update weights and biases for all layers
         new_layers_data = []
         for i in range(len(self.layers)):
             current_layer_data = self.layers[i]
             
-            if i == 0:
+            if i == 0: # For the first layer, previous activations are the original input_data (a_0)
                 prev_activations = np.array(input_data)
-            else:
-                # For hidden layers (i > 0), prev_activations should be the *activated output*
-                # of the previous layer (layer i-1), which is at index (i-1)*2 + 1
-                prev_activations = activations_list_raw[(i-1)*2 + 1]
-            
+            else: # For subsequent layers, previous activations are the activated outputs of the (i-1)th layer (a_i)
+                # a_i is at index `i*2` in activations_list_raw (this is the output of the *previous* layer that feeds *this* layer)
+                prev_activations = activations_list_raw[i * 2]
+
             delta_reshaped = np.array(deltas[i]).reshape(-1, 1)
             prev_act_reshaped = prev_activations.reshape(1, -1)
 
             weight_update = np.dot(delta_reshaped, prev_act_reshaped)
             
             new_weights = current_layer_data['weights'] - learning_rate * weight_update
-            
             new_biases = current_layer_data['biases'] - learning_rate * deltas[i]
             
             new_layers_data.append({
-                "weights": new_weights,
-                "biases": new_biases
+                "weights": new_weights.tolist(),
+                "biases": new_biases.tolist()
             })
 
-        self.layers = new_layers_data
-        return [d.tolist() for d in deltas]
+        self.layers = new_layers_data # Update the instance's layers with new weights/biases
+        return [d.tolist() for d in deltas if d is not None]
+
+# End of Custom Perceptron specific code
+
+# Initialize FastAPI app and CORS (from original main.py)
+# ...
 
 @app.post("/initialize")
 async def initialize_network(config: NetworkConfig):
@@ -819,7 +836,8 @@ async def initialize_network(config: NetworkConfig):
             hidden_size=config.hiddenSize,
             output_nodes=config.outputNodes,
             hidden_layers=config.hiddenLayers,
-            activation_name=config.activation
+            activation_name=config.activation,
+            output_activation_name=config.outputActivation # Pass new param
         )
         return [LayerModel(weights=layer["weights"].tolist(), biases=layer["biases"].tolist()) for layer in perceptron.layers]
     except ValueError as e:
@@ -831,15 +849,13 @@ async def train_network(req: TrainRequest):
     Trains the CustomPerceptron network for one iteration.
     Receives the current network state and training configuration from the frontend.
     """
-    # Initialize the perceptron with the current network state from frontend
-    perceptron = CustomPerceptron( # Use CustomPerceptron
+    perceptron = CustomPerceptron(
         activation_name=req.config.activation,
-        layers_data=req.network # Use the network structure provided by the frontend
+        output_activation_name=req.config.outputActivation, # Pass new param
+        layers_data=req.network
     )
-    print(f"BACKEND: CustomPerceptron instance in /train has {len(perceptron.layers)} layers after initialization.")
     
-    # Forward pass
-    activations_list = perceptron.forward_pass(req.input[0]) # Assuming single input for training iteration
+    activations_list = perceptron.forward_pass(req.input[0])
     
     # Backward pass and update
     deltas = perceptron.backward_pass(
@@ -849,13 +865,12 @@ async def train_network(req: TrainRequest):
         learning_rate=req.config.learningRate
     )
     
-    print(f"BACKEND: /train returning network with {len(perceptron.layers)} total layers.")
     error = float(np.mean((activations_list[-1] - req.target[0])**2))
 
     return TrainResponse(
         network=[LayerModel(weights=layer["weights"].tolist(), biases=layer["biases"].tolist()) for layer in perceptron.layers],
         error=error,
-        accuracy=0.0,
-        deltas=deltas, 
-        full_activations=[act.tolist() for act in activations_list] # Store all z and a values
+        accuracy=0.0, # Accuracy calculation would need to be added if desired
+        deltas=deltas,
+        full_activations=[act.tolist() for act in activations_list] # Ensure all elements are lists
     )

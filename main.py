@@ -18,8 +18,12 @@ import numpy as np
 from minisom import MiniSom
 from collections import Counter
 from gain_ratio import GainRatioDecisionTree # Keep this import
-from typing import List, Literal, Dict, Any
 import random
+from typing import List, Dict, Callable, Literal, Optional
+from sklearn.linear_model import Perceptron as SklearnPerceptron # Alias to avoid name conflict
+from sklearn.neural_network import MLPClassifier # Import MLPClassifier
+from sklearn.preprocessing import StandardScaler # For sklearn Perceptron if needed
+
 
 DATASETS = {
     "iris": datasets.load_iris,
@@ -614,263 +618,366 @@ async def predict_forest(req: PredictionRequest):
     }
     
     
-    
-class LayerModel(BaseModel):
-    weights: List[List[float]]
-    biases: List[float]
 
-class NetworkConfig(BaseModel):
-    inputSize: int
-    hiddenSize: int # For hidden layers
-    outputNodes: int
-    hiddenLayers: int # Number of hidden layers
-    activation: Literal["sigmoid", "relu", "identity","softmax"] # Activation for hidden layers
-    outputActivation: Literal["sigmoid", "relu", "identity", "softmax"] # NEW: Activation for output layer
-    learningRate: float
 
-class TrainRequest(BaseModel):
-    input: List[List[float]]
-    target: List[List[float]]
-    network: List[LayerModel]
-    config: NetworkConfig
+# --- Activation Functions for CustomPerceptron ---
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
 
-class TrainResponse(BaseModel):
-    network: List[LayerModel]
-    error: float
-    accuracy: float
-    deltas: List[List[float]]
-    full_activations: List[List[float]] # Store all z and a values (flattened to list of lists)
+def sigmoid_derivative(y):
+    return y * (1 - y)
 
+def relu(x):
+    return np.maximum(0, x)
+
+def relu_derivative(y):
+    return np.where(y > 0, 1, 0)
+
+def identity(x):
+    return x
+
+def identity_derivative(y):
+    return np.ones_like(y)
+
+def softmax(x):
+    exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
+
+def softmax_derivative(y):
+    return np.ones_like(y) # Placeholder, actual derivative depends on loss
+
+
+ACTIVATION_FUNCTIONS: Dict[str, Dict[str, Callable]] = {
+    "sigmoid": {"func": sigmoid, "derivative": sigmoid_derivative},
+    "relu": {"func": relu, "derivative": relu_derivative},
+    "identity": {"func": identity, "derivative": identity_derivative},
+    "softmax": {"func": softmax, "derivative": softmax_derivative}
+}
+
+# Mapping for sklearn activation names
+SKLEARN_ACTIVATION_MAP = {
+    "identity": "identity",
+    "sigmoid": "logistic",
+    "relu": "relu",
+    "softmax": "identity" # MLPClassifier handles softmax activation implicitly for multi-class
+}
+
+
+# --- CustomPerceptron Class (remains largely the same) ---
 class CustomPerceptron:
     def __init__(self, input_size: Optional[int] = None, hidden_size: Optional[int] = None,
                  output_nodes: Optional[int] = None, hidden_layers: int = 0,
-                 activation_name: str = "sigmoid", output_activation_name: str = "sigmoid", # NEW PARAMETER
-                 layers_data: Optional[List[LayerModel]] = None):
-        self.hidden_activation_name = activation_name
-        self.output_activation_name = output_activation_name
-        self.activations = {
-            "sigmoid": self._sigmoid,
-            "relu": self._relu,
-            "identity": self._identity,
-            "softmax": self._softmax
-        }
-        self.derivatives = {
-            "sigmoid": self._sigmoid_derivative,
-            "relu": self._relu_derivative,
-            "identity": self._identity_derivative,
-            # Note: For Softmax with MSE, the derivative is complex (Jacobian).
-            # This simplified derivative is for chain rule if treated element-wise, but problematic for true Softmax+MSE.
-            # Cross-entropy is preferred with Softmax.
-            "softmax": self._softmax_derivative
-        }
+                 activation_name: str = "sigmoid", output_activation_name: str = "sigmoid",
+                 layers_data: Optional[List[Dict[str, List[List[float]]]]] = None):
+        """
+        Initializes a custom multi-layer perceptron.
+        Args:
+            input_size: Number of input features.
+            hidden_size: Number of neurons in each hidden layer.
+            output_nodes: Number of output neurons.
+            hidden_layers: Number of hidden layers.
+            activation_name: Name of the activation function for hidden layers.
+            output_activation_name: Name of the activation function for the output layer.
+            layers_data: Optional pre-existing layer weights/biases for loading.
+        """
+        self.activation_func = ACTIVATION_FUNCTIONS[activation_name]["func"]
+        self.activation_derivative = ACTIVATION_FUNCTIONS[activation_name]["derivative"]
+        self.output_activation_func = ACTIVATION_FUNCTIONS[output_activation_name]["func"]
+        self.output_activation_derivative = ACTIVATION_FUNCTIONS[output_activation_name]["derivative"]
+
+        self.layers: List[Dict[str, np.ndarray]] = [] # Stores weights and biases
 
         if layers_data:
-            self.layers = []
+            # Load existing network from layers_data
             for layer_model in layers_data:
                 self.layers.append({
-                    "weights": np.array(layer_model.weights),
-                    "biases": np.array(layer_model.biases)
+                    "weights": np.array(layer_model['weights']),
+                    "biases": np.array(layer_model['biases'])
                 })
-        else:
-            self.layers = []
-            # Input to first hidden layer
-            self.layers.append({
-                "weights": np.random.randn(hidden_size, input_size) * 0.01,
-                "biases": np.zeros(hidden_size)
-            })
-
-            # Additional hidden layers
-            for _ in range(hidden_layers - 1):
+        elif input_size is not None and hidden_size is not None and output_nodes is not None:
+            # Initialize new network
+            if hidden_layers == 0:
+                # Direct input to output layer
                 self.layers.append({
-                    "weights": np.random.randn(hidden_size, hidden_size) * 0.01,
+                    "weights": np.random.randn(output_nodes, input_size) * 0.01,
+                    "biases": np.zeros(output_nodes)
+                })
+            else:
+                # Input to first hidden layer
+                self.layers.append({
+                    "weights": np.random.randn(hidden_size, input_size) * 0.01,
                     "biases": np.zeros(hidden_size)
                 })
 
-            # Last hidden layer to output layer
-            self.layers.append({
-                "weights": np.random.randn(output_nodes, hidden_size) * 0.01,
-                "biases": np.zeros(output_nodes)
-            })
+                # Additional hidden layers
+                for _ in range(hidden_layers - 1):
+                    self.layers.append({
+                        "weights": np.random.randn(hidden_size, hidden_size) * 0.01,
+                        "biases": np.zeros(hidden_size)
+                    })
 
-    def _sigmoid(self, x: np.ndarray) -> np.ndarray:
-        return 1 / (1 + np.exp(-np.clip(x, -500, 500))) # Add clipping for numerical stability
-
-    def _sigmoid_derivative(self, y: np.ndarray) -> np.ndarray:
-        return y * (1 - y)
-
-    def _relu(self, x: np.ndarray) -> np.ndarray:
-        return np.maximum(0, x)
-
-    def _relu_derivative(self, y: np.ndarray) -> np.ndarray:
-        return (y > 0).astype(float)
-
-    def _identity(self, x: np.ndarray) -> np.ndarray:
-        return x
-
-    def _identity_derivative(self, y: np.ndarray) -> np.ndarray:
-        return np.ones_like(y)
-    
-    def _softmax(self, x: np.ndarray) -> np.ndarray:
-        exp_x = np.exp(x - np.max(x))
-        return exp_x / np.sum(exp_x)
-
-    def _softmax_derivative(self, activated_output: np.ndarray) -> np.ndarray:
-        # This derivative is appropriate when softmax is followed by Cross-Entropy Loss
-        # and you want (y_hat - y). If used with MSE, it's problematic.
-        # For MSE, the d/dz_i (softmax_i) is s_i(1-s_i) + sum_{j!=i} (-s_i*s_j). This is not just s_i(1-s_i).
-        # To avoid overcomplicating, for MSE, we are essentially treating it element-wise like sigmoid.
-        # This will be `activated_output * (1 - activated_output)` for individual elements for simplified chain rule.
-        # However, for accurate softmax derivative in general, it's a Jacobian.
-        # Given the current structure, using y*(1-y) is the closest simplified element-wise derivative.
-        return activated_output * (1 - activated_output) # Simplified for element-wise chain rule
-
-    def get_activation_function(self, layer_idx: int):
-        if layer_idx == len(self.layers) - 1: # Last layer
-            return self.activations.get(self.output_activation_name, self._sigmoid)
-        return self.activations.get(self.hidden_activation_name, self._sigmoid)
-
-    def get_activation_derivative(self, layer_idx: int, activated_output: np.ndarray):
-        if layer_idx == len(self.layers) - 1: # Last layer
-            act_name = self.output_activation_name
+                # Last hidden layer to output layer
+                self.layers.append({
+                    "weights": np.random.randn(output_nodes, hidden_size) * 0.01,
+                    "biases": np.zeros(output_nodes)
+                })
         else:
-            act_name = self.hidden_activation_name
-        
-        # Pass the activated output to the derivative function
-        if act_name == "sigmoid":
-            return self._sigmoid_derivative(activated_output)
-        elif act_name == "relu":
-            return self._relu_derivative(activated_output)
-        elif act_name == "identity":
-            return self._identity_derivative(activated_output)
-        elif act_name == "softmax":
-            return self._softmax_derivative(activated_output) # Use the (simplified) softmax derivative
+            raise ValueError("Either 'layers_data' or all of 'input_size', 'hidden_size', 'output_nodes' must be provided for initialization.")
 
-    def forward_pass(self, input_data: List[float]):
-        activations_list = [] # Will store a_0, z_1, a_1, z_2, a_2, ..., z_L, a_L
+
+    def forward_pass(self, input_data: List[float]) -> List[np.ndarray]:
+        activations_list = [np.array(input_data)] # First element is input
         current_activation = np.array(input_data)
-        activations_list.append(current_activation) # a_0 (input layer's output)
 
-        for i, layer_data in enumerate(self.layers):
-            weights = layer_data["weights"]
-            biases = layer_data["biases"]
+        for i, layer in enumerate(self.layers):
+            weights = layer["weights"]
+            biases = layer["biases"]
+            net_input = np.dot(weights, current_activation) + biases
 
-            z = np.dot(weights, current_activation) + biases
-            activations_list.append(z) # z_{i+1} (raw output of current layer)
-
-            current_activation = self.get_activation_function(i)(z) # a_{i+1} (activated output of current layer)
+            if i == len(self.layers) - 1: # Output layer
+                current_activation = self.output_activation_func(net_input)
+            else: # Hidden layer
+                current_activation = self.activation_func(net_input)
             activations_list.append(current_activation)
-
         return activations_list
 
-    def backward_pass(self, input_data, target, activations_list_raw, learning_rate):
-        deltas = [None] * len(self.layers) # deltas[i] corresponds to the delta for self.layers[i]
+    def backward_pass(self, input_data: List[float], target: List[float],
+                      activations_list_raw: List[np.ndarray], learning_rate: float) -> List[np.ndarray]:
+        targets = np.array(target)
+        output = activations_list_raw[-1]
+        error = output - targets
 
-        # Output layer delta calculation (last layer in self.layers, index L-1)
-        # a_L is activations_list_raw[-1], z_L is activations_list_raw[-2]
-        output_activations = activations_list_raw[-1] # a_L
-        target = np.array(target).reshape(output_activations.shape)
+        if self.output_activation_derivative == softmax_derivative: # Special handling for softmax with common loss
+             output_delta = error
+        else:
+            output_delta = error * self.output_activation_derivative(output)
 
-        loss_derivative = 2 * (output_activations - target) # dC/da_L (for MSE)
+        deltas = [output_delta]
 
-        # da_L/dz_L using the output layer's specific activation derivative
-        output_layer_activation_derivative = self.get_activation_derivative(len(self.layers) - 1, output_activations)
-        deltas[len(self.layers) - 1] = loss_derivative * output_layer_activation_derivative
-
-        # Backpropagate through hidden layers (from second-to-last layer down to the first hidden layer)
-        # Iterate from the (L-2)th layer down to the 0th layer (first hidden layer)
         for i in reversed(range(len(self.layers) - 1)):
-            current_layer_idx = i # This `i` is the 0-indexed layer in `self.layers`
+            current_layer_activation = activations_list_raw[i + 1]
+            prev_layer_activation = activations_list_raw[i]
+            next_layer_weights = self.layers[i+1]["weights"]
+            next_layer_delta = deltas[0]
 
-            next_layer_weights = self.layers[current_layer_idx + 1]['weights'] # W_{i+1}
+            error_propagated = np.dot(next_layer_weights.T, next_layer_delta)
+
+            delta = error_propagated * self.activation_derivative(current_layer_activation)
+            deltas.insert(0, delta)
+
+        for i, layer in enumerate(self.layers):
+            current_input = activations_list_raw[i]
+            delta = deltas[i]
+
+            if current_input.ndim == 1:
+                current_input = current_input.reshape(-1, 1)
+
+            if delta.ndim == 1:
+                delta = delta.reshape(-1, 1)
+
+            if delta.shape[1] != 1 or current_input.shape[0] != 1:
+                weight_update = np.dot(delta, current_input.T)
+            else:
+                weight_update = np.outer(delta, current_input)
+
+            layer["weights"] -= learning_rate * weight_update
+            layer["biases"] -= learning_rate * delta.flatten()
+
+        return deltas
+
+# --- Sklearn Perceptron/MLPClassifier Wrapper ---
+class SklearnPerceptronWrapper:
+    def __init__(self, input_size: int, output_nodes: int, hidden_size: int = 0, hidden_layers: int = 0,
+                 activation_name: str = "relu", output_activation_name: str = "identity",
+                 learning_rate: float = 0.001, random_state: int = None,
+                 layers_data: Optional[List[Dict[str, List[List[float]]]]] = None):
+
+        self.input_size = input_size
+        self.output_nodes = output_nodes
+        self.hidden_size = hidden_size
+        self.hidden_layers = hidden_layers
+        self.output_activation_name = output_activation_name
+        self.fitted = False
+        self.scaler = StandardScaler()
+        self.model = None
+
+        if hidden_layers == 0:
+            self.model = SklearnPerceptron(
+                eta0=learning_rate,
+                fit_intercept=True,
+                shuffle=False,
+                random_state=random_state,
+                max_iter=1,
+                tol=None
+            )
+            if layers_data and len(layers_data) == 1:
+                # Manually set coef_ and intercept_ if pre-trained data provided
+                self.model.coef_ = np.array(layers_data[0]['weights'])
+                self.model.intercept_ = np.array(layers_data[0]['biases'])
+                self.fitted = True # Mark as fitted if weights are provided
+        else:
+            hidden_layer_sizes = tuple([hidden_size] * hidden_layers)
             
-            # error_prop is (W_{i+1})^T * delta_{i+1}
-            error_prop = np.dot(next_layer_weights.T, deltas[current_layer_idx + 1])
+            # Map activation name to sklearn's
+            sklearn_activation = SKLEARN_ACTIVATION_MAP.get(activation_name, "relu")
+            if output_activation_name == "softmax":
+                self.model = MLPClassifier(
+                    hidden_layer_sizes=hidden_layer_sizes,
+                    activation=sklearn_activation,
+                    solver='sgd', # Stochastic Gradient Descent
+                    learning_rate_init=learning_rate,
+                    max_iter=1, # Train for one iteration per call
+                    shuffle=False,
+                    random_state=random_state,
+                    tol=None, # Disable tolerance for single-step training
+                    warm_start=True, # To allow incremental fitting
+                    alpha=0.0001, 
+                )
+            else:
+                 self.model = MLPClassifier(
+                    hidden_layer_sizes=hidden_layer_sizes,
+                    activation=sklearn_activation,
+                    solver='sgd', # Stochastic Gradient Descent
+                    learning_rate_init=learning_rate,
+                    max_iter=1, # Train for one iteration per call
+                    shuffle=False,
+                    random_state=random_state,
+                    tol=None, # Disable tolerance for single-step training
+                    warm_start=True, # To allow incremental fitting
+                    alpha=0.0001, 
+                )
 
-            # activated output of the current layer (a_{i+1})
-            # a_k is at index 2*k. Here k = current_layer_idx + 1
-            current_layer_activations_a = activations_list_raw[(current_layer_idx + 1) * 2] 
 
-            # da_{i+1}/dz_{i+1} using the current layer's activation derivative
-            current_layer_activation_derivative = self.get_activation_derivative(current_layer_idx, current_layer_activations_a)
-            
-            deltas[current_layer_idx] = error_prop * current_layer_activation_derivative
+            if layers_data:
+                # Load pre-trained weights and biases for MLPClassifier
+                self.model.coefs_ = [np.array(layer['weights']) for layer in layers_data]
+                self.model.intercepts_ = [np.array(layer['biases']) for layer in layers_data]
+                self.model.n_layers_ = len(layers_data) + 1 # Input layer + num_layers
+                self.model.n_outputs_ = self.output_nodes # Set number of outputs
+                self.model.out_activation_ = SKLEARN_ACTIVATION_MAP.get(output_activation_name, "identity") # For MLP
+                self.fitted = True # Mark as fitted
 
-        # Update weights and biases for all layers
-        new_layers_data = []
-        for i in range(len(self.layers)):
-            current_layer_data = self.layers[i]
-            
-            if i == 0: # For the first layer, previous activations are the original input_data (a_0)
-                prev_activations = np.array(input_data)
-            else: # For subsequent layers, previous activations are the activated outputs of the (i-1)th layer (a_i)
-                # a_i is at index `i*2` in activations_list_raw (this is the output of the *previous* layer that feeds *this* layer)
-                prev_activations = activations_list_raw[i * 2]
+    def _apply_output_activation_for_display(self, net_input: np.ndarray, activation_name: str) -> np.ndarray:
+        """Applies specified activation to the raw output for consistent display."""
+        func = ACTIVATION_FUNCTIONS.get(activation_name, {}).get("func", identity)
+        return func(net_input)
 
-            delta_reshaped = np.array(deltas[i]).reshape(-1, 1)
-            prev_act_reshaped = prev_activations.reshape(1, -1)
+    def forward_pass(self, input_data: List[float], output_activation_name: str = "identity") -> List[np.ndarray]:
+        X = np.array(input_data).reshape(1, -1)
 
-            weight_update = np.dot(delta_reshaped, prev_act_reshaped)
-            
-            new_weights = current_layer_data['weights'] - learning_rate * weight_update
-            new_biases = current_layer_data['biases'] - learning_rate * deltas[i]
-            
-            new_layers_data.append({
-                "weights": new_weights.tolist(),
-                "biases": new_biases.tolist()
-            })
+        # Handle scaling consistently
+        if self.fitted:
+            X_processed = self.scaler.transform(X)
+        else:
+            # If not fitted, we might not have a scaler yet.
+            # If layers_data was provided and it's an MLPClassifier, it can predict.
+            # If it's a Perceptron and not fitted, its coef_ and intercept_ will be None.
+            X_processed = X
 
-        self.layers = new_layers_data # Update the instance's layers with new weights/biases
-        return [d.tolist() for d in deltas if d is not None]
+        activations_list = [X.flatten()] # First element is input
 
-# End of Custom Perceptron specific code
+        if not self.fitted and (self.model is None or not hasattr(self.model, 'coefs_') or self.model.coefs_ is None):
+            # Before first fit or if no pre-trained weights, return dummy output
+            initial_output = np.random.rand(self.output_nodes) * 0.01
+            activations_list.append(initial_output)
+            return activations_list
 
-# Initialize FastAPI app and CORS (from original main.py)
-# ...
+        if isinstance(self.model, SklearnPerceptron):
+            # For SklearnPerceptron, decision_function gives raw scores
+            net_input = self.model.decision_function(X_processed)
+            if self.output_nodes == 1:
+                # Sklearn Perceptron is inherently binary, returns 1D array for single class
+                output = self._apply_output_activation_for_display(net_input.flatten(), output_activation_name)
+            else:
+                 # Sklearn Perceptron is not designed for multi-output directly like this.
+                 # This branch might need more thought if the user truly wants multi-output Perceptron.
+                 # For now, let's treat it as if decision_function can return multiple scores.
+                 output = self._apply_output_activation_for_display(net_input.flatten(), output_activation_name)
 
-@app.post("/initialize")
-async def initialize_network(config: NetworkConfig):
-    """Initializes a new CustomPerceptron network with specified configuration."""
-    try:
-        perceptron = CustomPerceptron(
-            input_size=config.inputSize,
-            hidden_size=config.hiddenSize,
-            output_nodes=config.outputNodes,
-            hidden_layers=config.hiddenLayers,
-            activation_name=config.activation,
-            output_activation_name=config.outputActivation # Pass new param
-        )
-        return [LayerModel(weights=layer["weights"].tolist(), biases=layer["biases"].tolist()) for layer in perceptron.layers]
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+            activations_list.append(output)
+            return activations_list
 
-@app.post("/train")
-async def train_network(req: TrainRequest):
-    """
-    Trains the CustomPerceptron network for one iteration.
-    Receives the current network state and training configuration from the frontend.
-    """
-    perceptron = CustomPerceptron(
-        activation_name=req.config.activation,
-        output_activation_name=req.config.outputActivation, # Pass new param
-        layers_data=req.network
-    )
-    
-    activations_list = perceptron.forward_pass(req.input[0])
-    
-    # Backward pass and update
-    deltas = perceptron.backward_pass(
-        input_data=req.input[0],
-        target=req.target[0],
-        activations_list_raw=activations_list,
-        learning_rate=req.config.learningRate
-    )
-    
-    error = float(np.mean((activations_list[-1] - req.target[0])**2))
+        elif isinstance(self.model, MLPClassifier):
+            # For MLPClassifier, we need to manually compute activations for each layer
+            # because .predict_proba or .predict only give the final output.
+            # ._forward_pass is internal, so we replicate logic for visualization.
+            current_activation = X_processed.copy()
+            activations_list_raw = [X.flatten()] # Store original input for visualization if needed
 
-    return TrainResponse(
-        network=[LayerModel(weights=layer["weights"].tolist(), biases=layer["biases"].tolist()) for layer in perceptron.layers],
-        error=error,
-        accuracy=0.0, # Accuracy calculation would need to be added if desired
-        deltas=deltas,
-        full_activations=[act.tolist() for act in activations_list] # Ensure all elements are lists
-    )
+            # Iterate through layers to get intermediate activations
+            for i in range(len(self.model.coefs_)):
+                net_input = np.dot(current_activation, self.model.coefs_[i]) + self.model.intercepts_[i]
+                
+                # Apply activation function for hidden layers or output layer
+                if i < len(self.model.coefs_) - 1: # Hidden layers
+                    current_activation = ACTIVATION_FUNCTIONS[self.model.activation]["func"](net_input)
+                else: # Output layer
+                    # Use the specified output activation function for display
+                    current_activation = self._apply_output_activation_for_display(net_input, output_activation_name)
+
+                activations_list.append(current_activation.flatten()) # Flatten for consistent shape
+            return activations_list
+
+        return [X.flatten(), np.random.rand(self.output_nodes).flatten() * 0.01] # Fallback
+
+
+    def partial_fit(self, input_data: List[float], target: List[float], classes: Optional[List[int]] = None) -> float:
+        """
+        Trains the Sklearn Perceptron/MLPClassifier for one iteration.
+        """
+        X = np.array(input_data).reshape(1, -1)
+        y = np.array(target)
+
+        # Reshape y to be 1D for single-output, or 2D for multi-output if necessary for MLPClassifier
+        if self.output_nodes == 1:
+            y = y.reshape(1,)
+        else:
+            y = y.reshape(1, -1) # For multi-output classifiers
+
+        if not self.fitted:
+            self.scaler.fit(X)
+            # Sklearn Perceptron/MLPClassifier needs to know all possible classes upfront for partial_fit
+            # This is crucial. If `classes` is not passed correctly, it will fail on the first `partial_fit`.
+            if classes is None:
+                # Default classes for binary classification (0, 1). Adjust as needed for multi-class.
+                if self.output_nodes == 1: # For single output, assume binary classification
+                    classes = [0, 1]
+                else: # For multi-output, assume one-hot encoded or similar targets, so pass distinct values
+                    # This is a simplification; in a real app, you'd need actual class labels
+                    classes = list(range(self.output_nodes))
+                    # If target is one-hot, convert it to single class label for partial_fit
+                    if len(y.shape) > 1 and y.shape[1] > 1:
+                         y = np.argmax(y, axis=1) # Convert one-hot to class label for MLPClassifier.partial_fit
+
+
+            self.model.partial_fit(self.scaler.transform(X), y, classes=classes)
+            self.fitted = True
+        else:
+            if len(y.shape) > 1 and y.shape[1] > 1 and isinstance(self.model, MLPClassifier):
+                y = np.argmax(y, axis=1) # Convert one-hot to class label if MLPClassifier and multi-output
+
+            self.model.partial_fit(self.scaler.transform(X), y)
+
+        # Calculate error (MSE for visualization)
+        predictions = self.forward_pass(input_data, self.output_activation_name)[-1]
+        error = float(np.mean((predictions - np.array(target))**2))
+        return error
+
+    def get_model_data(self) -> List[Dict[str, List[List[float]]]]:
+        """Returns the current weights and biases."""
+        if not self.fitted:
+            # If not fitted, return dummy or empty if model hasn't been initialized internally
+            return []
+
+        if isinstance(self.model, SklearnPerceptron):
+            if hasattr(self.model, 'coef_') and self.model.coef_ is not None and hasattr(self.model, 'intercept_') and self.model.intercept_ is not None:
+                return [{"weights": self.model.coef_.tolist(), "biases": self.model.intercept_.tolist()}]
+            return []
+        elif isinstance(self.model, MLPClassifier):
+            if hasattr(self.model, 'coefs_') and self.model.coefs_ is not None and hasattr(self.model, 'intercepts_') and self.model.intercepts_ is not None:
+                return [
+                    {"weights": coef.tolist(), "biases": intercept.tolist()}
+                    for coef, intercept in zip(self.model.coefs_, self.model.intercepts_)
+                ]
+            return []
+        return []
